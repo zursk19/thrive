@@ -16,6 +16,10 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
+## Stripe Checkout
+
+Create a one-time Price in Stripe, copy `.env.example` to `.env.local`, and set `STRIPE_SECRET_KEY` to a Stripe test secret key and `STRIPE_PRICE_ID` to that Price ID. Restart the development server after changing environment variables. The checkout session is created on the server, and the app verifies the returned session with Stripe before showing payment confirmation. Do not commit `.env.local` or use live keys until the payment flow is ready for production.
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.

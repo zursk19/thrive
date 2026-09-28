@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 
 type StepKey =
   | "welcome"
@@ -19,6 +19,7 @@ type StepKey =
   | "consent"
   | "policy"
   | "review"
+  | "payment"
   | "result";
 
 type HealthQuestion = {
@@ -257,8 +258,26 @@ const stepLabelMap: Record<StepKey, string> = {
   consent: "Medication consent",
   policy: "Payment policy",
   review: "Review",
+  payment: "Payment",
   result: "Result",
 };
+
+const subscribeToCheckoutReturn = (callback: () => void) => {
+  window.addEventListener("popstate", callback);
+  return () => window.removeEventListener("popstate", callback);
+};
+
+const getCheckoutReturnSnapshot = () => {
+  const params = new URLSearchParams(window.location.search);
+  const checkout = params.get("checkout");
+
+  if (checkout === "cancelled") return "cancelled";
+  if (checkout === "success") return `success:${params.get("session_id") ?? ""}`;
+
+  return null;
+};
+
+const getServerCheckoutReturnSnapshot = () => null;
 
 const formatPhoneNumber = (value: string) => {
   const digits = value.replace(/\D/g, "").slice(0, 10);
@@ -332,10 +351,21 @@ export default function Home() {
   const [form, setForm] = useState<FormState>(initialForm);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [submissionMessage, setSubmissionMessage] = useState<string | null>(null);
+  const [paymentRequired, setPaymentRequired] = useState(false);
+  const [paymentComplete, setPaymentComplete] = useState(false);
+  const [paymentMessage, setPaymentMessage] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isStartingCheckout, setIsStartingCheckout] = useState(false);
+  const checkoutReturn = useSyncExternalStore(
+    subscribeToCheckoutReturn,
+    getCheckoutReturnSnapshot,
+    getServerCheckoutReturnSnapshot
+  );
 
   const route = useMemo(() => getRoute(form), [form]);
-  const currentStep = route[currentIndex] ?? "welcome";
-  const progress = route.length ? ((currentIndex + 1) / route.length) * 100 : 0;
+  const isPaymentStep = paymentRequired || checkoutReturn !== null;
+  const currentStep = isPaymentStep ? "payment" : route[currentIndex] ?? "welcome";
+  const progress = isPaymentStep ? 100 : route.length ? ((currentIndex + 1) / route.length) * 100 : 0;
   const bmi = calculateBMI(form);
 
   useEffect(() => {
@@ -343,6 +373,37 @@ export default function Home() {
       setCurrentIndex(route.length - 1);
     }
   }, [currentIndex, route.length]);
+
+  useEffect(() => {
+    if (!checkoutReturn?.startsWith("success:")) return;
+
+    const sessionId = checkoutReturn.slice("success:".length);
+    if (!sessionId) return;
+
+    const controller = new AbortController();
+
+    fetch(`/api/checkout?session_id=${encodeURIComponent(sessionId)}`, {
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(payload?.error || "Unable to verify payment status.");
+        }
+        if (!payload?.paid) {
+          throw new Error("Payment is not confirmed yet. Please check again shortly.");
+        }
+        setPaymentComplete(true);
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          const message = error instanceof Error ? error.message : "Unable to verify payment status.";
+          setPaymentMessage(message);
+        }
+      });
+
+    return () => controller.abort();
+  }, [checkoutReturn]);
 
   const updateField = (key: keyof FormState, value: string | boolean | string[]) => {
     setForm((current) => ({ ...current, [key]: value }));
@@ -459,12 +520,15 @@ export default function Home() {
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (currentStep !== "review" || isSubmitting) return;
+
     const invalidMessage = validateCurrentStep();
     if (invalidMessage) {
       setSubmissionMessage(invalidMessage);
       return;
     }
 
+    setIsSubmitting(true);
     try {
       setSubmissionMessage("Submitting intake...");
 
@@ -493,11 +557,41 @@ export default function Home() {
         throw new Error(payload?.error || `Request failed with status ${response.status}`);
       }
 
-      setSubmissionMessage("Your test intake has been submitted successfully.");
+      setSubmissionMessage(null);
+      setPaymentMessage(null);
+      setCurrentIndex(route.length);
+      setPaymentRequired(true);
     } catch (error) {
       console.error("Mock POST failed:", error);
       const message = error instanceof Error ? error.message : "There was a problem submitting the intake. Please try again.";
       setSubmissionMessage(message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleStartCheckout = async () => {
+    if (isStartingCheckout || paymentComplete) return;
+
+    setIsStartingCheckout(true);
+    setPaymentMessage(null);
+
+    try {
+      const response = await fetch("/api/checkout", { method: "POST" });
+      const payload = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(payload?.error || "Unable to start secure checkout.");
+      }
+      if (typeof payload?.url !== "string") {
+        throw new Error("The checkout session did not return a valid URL.");
+      }
+
+      window.location.assign(payload.url);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to start secure checkout.";
+      setPaymentMessage(message);
+      setIsStartingCheckout(false);
     }
   };
 
@@ -1007,6 +1101,47 @@ export default function Home() {
           </div>
         );
 
+      case "payment": {
+        const checkoutSucceeded = checkoutReturn?.startsWith("success:");
+        const checkoutCancelled = checkoutReturn === "cancelled";
+
+        return (
+          <div className="space-y-6">
+            <div>
+              <p className="text-xs font-extrabold uppercase tracking-[0.2em] text-[#47aead]">
+                Intake submitted
+              </p>
+              <h2 className="mt-3 text-4xl font-bold tracking-tight text-slate-900">
+                {paymentComplete ? "Payment received" : "Complete your payment"}
+              </h2>
+              <p className="mt-3 max-w-2xl text-base leading-7 text-slate-600">
+                {paymentComplete
+                  ? "Your payment has been confirmed. You can safely close this page."
+                  : "Continue to Stripe's secure checkout to complete payment. Your health information is not sent to Stripe."}
+              </p>
+            </div>
+
+            {checkoutCancelled ? (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+                Checkout was canceled. You can try again when you are ready.
+              </div>
+            ) : null}
+
+            {checkoutSucceeded && !paymentComplete && !paymentMessage ? (
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
+                Verifying your payment with Stripe...
+              </div>
+            ) : null}
+
+            {paymentMessage ? (
+              <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800">
+                {paymentMessage}
+              </div>
+            ) : null}
+          </div>
+        );
+      }
+
       default:
         return null;
     }
@@ -1028,7 +1163,7 @@ export default function Home() {
             </div>
             <div className="text-right text-xs text-slate-200">
               <div className="font-extrabold uppercase tracking-[0.14em]">{currentStepLabel}</div>
-              <div className="mt-1">{currentIndex + 1} of {route.length}</div>
+              <div className="mt-1">{isPaymentStep ? route.length + 1 : currentIndex + 1} of {route.length + (isPaymentStep ? 1 : 0)}</div>
             </div>
           </div>
 
@@ -1053,16 +1188,18 @@ export default function Home() {
         </div>
 
         <div className="flex items-center justify-between gap-4 border-t border-slate-200 bg-white px-5 py-4 md:px-8">
-          <button
-            type="button"
-            onClick={moveBack}
-            disabled={currentIndex === 0}
-            className="min-w-[118px] rounded-xl bg-slate-100 px-5 py-3 text-sm font-bold text-slate-800 transition hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            Back
-          </button>
+          {currentStep !== "payment" ? (
+            <button
+              type="button"
+              onClick={moveBack}
+              disabled={currentIndex === 0}
+              className="min-w-[118px] rounded-xl bg-slate-100 px-5 py-3 text-sm font-bold text-slate-800 transition hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Back
+            </button>
+          ) : null}
 
-          {currentStep !== "review" ? (
+          {currentStep !== "review" && currentStep !== "payment" ? (
             <button
               type="button"
               onClick={moveNext}
@@ -1070,19 +1207,38 @@ export default function Home() {
             >
               {currentIndex === route.length - 1 ? "Complete" : "Continue"}
             </button>
-          ) : (
+          ) : null}
+
+          {currentStep === "payment" ? (
+            <button
+              type="button"
+              onClick={handleStartCheckout}
+              disabled={isStartingCheckout || paymentComplete || Boolean(checkoutReturn?.startsWith("success:"))}
+              className="min-w-[190px] rounded-xl bg-[linear-gradient(135deg,_#58d0cc,_#3fb5b4)] px-5 py-3 text-sm font-bold text-slate-900 shadow-[0_7px_18px_rgba(63,181,180,0.2)] transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {paymentComplete
+                ? "Payment complete"
+                : checkoutReturn?.startsWith("success:")
+                  ? "Verifying payment"
+                  : isStartingCheckout
+                    ? "Opening checkout..."
+                    : "Continue to secure checkout"}
+            </button>
+          ) : null}
+
+          {currentStep === "review" ? (
             <button
               type="submit"
-              onClick={handleSubmit}
-              className="min-w-[118px] rounded-xl bg-[linear-gradient(135deg,_#58d0cc,_#3fb5b4)] px-5 py-3 text-sm font-bold text-slate-900 shadow-[0_7px_18px_rgba(63,181,180,0.2)] transition hover:brightness-105"
+              disabled={isSubmitting}
+              className="min-w-[118px] rounded-xl bg-[linear-gradient(135deg,_#58d0cc,_#3fb5b4)] px-5 py-3 text-sm font-bold text-slate-900 shadow-[0_7px_18px_rgba(63,181,180,0.2)] transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              Complete intake
+              {isSubmitting ? "Submitting..." : "Complete intake"}
             </button>
-          )}
+          ) : null}
         </div>
 
         <footer className="border-t border-slate-200 bg-slate-50 px-4 py-3 text-center text-[11px] text-slate-500">
-          Test preview only. Answers stay on this page and are cleared when the page is closed or refreshed.
+          Payment is handled by Stripe Checkout. Health information is not sent to Stripe.
         </footer>
       </div>
     </main>
